@@ -3,6 +3,8 @@ import asyncio
 import logging
 import json
 import re
+import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 import pytz
 import gspread
@@ -16,7 +18,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Настройки из переменных окружения Railway ─────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 SPREADSHEET_ID  = os.environ["SPREADSHEET_ID"].strip()
 SHEET_NAME      = os.environ.get("SHEET_NAME", "Лист1")
@@ -28,17 +29,17 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-# Колонки таблицы (индексы с 0)
-COL_DATE   = 0  # A: Дата
-COL_TIME   = 1  # B: Время
-COL_CHAT   = 2  # C: Chat ID
-COL_TEXT   = 3  # D: Текст поста
-COL_MEDIA  = 4  # E: Ссылка на фото (необязательно)
-COL_STATUS = 5  # F: Статус (бот пишет сам)
+COL_DATE      = 0  # A: Дата
+COL_TIME      = 1  # B: Время
+COL_CHAT_RU   = 2  # C: Chat ID РУ
+COL_CHAT_UKR  = 3  # D: Chat ID УКР
+COL_TEXT      = 4  # E: Текст поста
+COL_MEDIA_RU  = 5  # F: Медиа РУ
+COL_MEDIA_UKR = 6  # G: Медиа УКР
+COL_STATUS    = 7  # H: Статус
 
 
 def get_sheet():
-    """Подключение к Google Sheets через Service Account."""
     creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
     if not creds_json:
         raise ValueError("GOOGLE_CREDENTIALS_JSON не задан!")
@@ -48,10 +49,26 @@ def get_sheet():
     return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
 
-def excel_date_to_datetime(excel_date_float: float, tz) -> datetime | None:
-    """Конвертирует числовую дату Excel в datetime."""
+def translate_to_ukrainian(text: str) -> str:
     try:
-        # Excel считает дни с 30.12.1899
+        encoded = urllib.parse.quote(text)
+        url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ru&tl=uk&dt=t&q={encoded}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode('utf-8'))
+        translated = ''
+        for part in result[0]:
+            if part[0]:
+                translated += part[0]
+        logger.info(f"Перевод успешен, длина: {len(translated)}")
+        return translated
+    except Exception as e:
+        logger.error(f"Ошибка перевода: {e}")
+        return text
+
+
+def excel_date_to_datetime(excel_date_float: float, tz) -> datetime | None:
+    try:
         base = datetime(1899, 12, 30)
         days = int(excel_date_float)
         time_fraction = excel_date_float - days
@@ -65,22 +82,16 @@ def excel_date_to_datetime(excel_date_float: float, tz) -> datetime | None:
 
 
 def parse_datetime(date_val: str, time_val: str, tz) -> datetime | None:
-    """Парсит дату и время из ячеек — поддерживает числа Excel и текст."""
     date_val = date_val.strip()
     time_val = time_val.strip()
-
-    # Числовой формат Excel (дата и время вместе в одной ячейке)
     try:
         excel_num = float(date_val)
-        # Если время задано отдельно — берём дату из числа даты, время отдельно
         if time_val:
             try:
                 time_num = float(time_val)
-                # Складываем дату + время
                 combined = int(excel_num) + time_num
                 return excel_date_to_datetime(combined, tz)
             except ValueError:
-                # Время как текст HH:MM
                 dt = excel_date_to_datetime(excel_num, tz)
                 if dt:
                     t = datetime.strptime(time_val, "%H:%M")
@@ -89,8 +100,6 @@ def parse_datetime(date_val: str, time_val: str, tz) -> datetime | None:
             return excel_date_to_datetime(excel_num, tz)
     except ValueError:
         pass
-
-    # Текстовый формат даты
     for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
         try:
             d = datetime.strptime(date_val, fmt)
@@ -100,15 +109,10 @@ def parse_datetime(date_val: str, time_val: str, tz) -> datetime | None:
             return tz.localize(d)
         except ValueError:
             continue
-
     return None
 
 
 def convert_drive_url(url: str) -> str:
-    """
-    Конвертирует ссылку Google Drive в прямую ссылку для скачивания.
-    https://drive.google.com/file/d/FILE_ID/view?... → https://drive.google.com/uc?export=download&id=FILE_ID
-    """
     url = url.strip()
     match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
     if match:
@@ -117,8 +121,7 @@ def convert_drive_url(url: str) -> str:
     return url
 
 
-async def send_post(bot: Bot, chat_id: str, text: str, media_url: str | None):
-    """Отправляет пост — текст или текст с фото."""
+async def send_post(bot: Bot, chat_id: str, text: str, media_url: str):
     chat_id = chat_id.strip()
     if media_url and media_url.strip():
         url = convert_drive_url(media_url)
@@ -129,7 +132,6 @@ async def send_post(bot: Bot, chat_id: str, text: str, media_url: str | None):
 
 
 async def check_and_send(bot: Bot):
-    """Читает таблицу и отправляет посты по расписанию."""
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
     window_start = now - timedelta(minutes=2)
@@ -145,15 +147,13 @@ async def check_and_send(bot: Bot):
         logger.warning("Таблица пустая")
         return
 
-    # Пропускаем заголовок
     start_row = 1 if rows[0][COL_DATE].lower() in ("дата", "date") else 0
     logger.info(f"Всего строк: {len(rows)}, проверяю с строки {start_row + 1}")
 
     for i, row in enumerate(rows[start_row:], start=start_row + 2):
-        if len(row) < 4:
+        if len(row) < 5:
             continue
 
-        # Пропускаем уже отправленные
         status = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
         if status.startswith("✅"):
             continue
@@ -161,7 +161,6 @@ async def check_and_send(bot: Bot):
         date_val = row[COL_DATE]
         time_val = row[COL_TIME] if len(row) > COL_TIME else ""
 
-        # Пропускаем строки без даты
         if not date_val.strip():
             continue
 
@@ -173,21 +172,38 @@ async def check_and_send(bot: Bot):
         logger.info(f"Строка {i}: дата поста {post_dt.strftime('%d.%m.%Y %H:%M')}, сейчас {now.strftime('%d.%m.%Y %H:%M')}")
 
         if window_start <= post_dt <= now:
-            chat_id = row[COL_CHAT]
-            text    = row[COL_TEXT]
-            media   = row[COL_MEDIA].strip() if len(row) > COL_MEDIA else ""
+            chat_ru   = row[COL_CHAT_RU].strip() if len(row) > COL_CHAT_RU else ""
+            chat_ukr  = row[COL_CHAT_UKR].strip() if len(row) > COL_CHAT_UKR else ""
+            text      = row[COL_TEXT]
+            media_ru  = row[COL_MEDIA_RU].strip() if len(row) > COL_MEDIA_RU else ""
+            media_ukr = row[COL_MEDIA_UKR].strip() if len(row) > COL_MEDIA_UKR else ""
 
-            logger.info(f"Строка {i}: отправляю в {chat_id}")
-            try:
-                await send_post(bot, chat_id, text, media)
-                new_status = f"✅ Отправлено {now.strftime('%d.%m %H:%M')}"
-                logger.info(f"Строка {i}: успешно!")
-            except TelegramError as e:
-                new_status = f"❌ Telegram ошибка: {e}"
-                logger.error(f"Строка {i}: {e}")
-            except Exception as e:
-                new_status = f"❌ Ошибка: {e}"
-                logger.error(f"Строка {i}: {e}")
+            statuses = []
+
+            if chat_ru:
+                logger.info(f"Строка {i}: отправляю РУ в {chat_ru}")
+                try:
+                    await send_post(bot, chat_ru, text, media_ru)
+                    statuses.append("✅ РУ")
+                    logger.info(f"Строка {i}: РУ отправлено!")
+                except TelegramError as e:
+                    statuses.append(f"❌ РУ: {e}")
+                    logger.error(f"Строка {i}: РУ ошибка — {e}")
+
+            if chat_ukr:
+                logger.info(f"Строка {i}: перевожу на украинский...")
+                text_ukr = translate_to_ukrainian(text)
+                media_for_ukr = media_ukr if media_ukr else media_ru
+                logger.info(f"Строка {i}: отправляю УКР в {chat_ukr}")
+                try:
+                    await send_post(bot, chat_ukr, text_ukr, media_for_ukr)
+                    statuses.append("✅ УКР")
+                    logger.info(f"Строка {i}: УКР отправлено!")
+                except TelegramError as e:
+                    statuses.append(f"❌ УКР: {e}")
+                    logger.error(f"Строка {i}: УКР ошибка — {e}")
+
+            new_status = f"{' | '.join(statuses)} {now.strftime('%d.%m %H:%M')}"
 
             try:
                 sheet.update_cell(i, COL_STATUS + 1, new_status)
