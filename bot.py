@@ -25,7 +25,6 @@ SHEET_NAME      = os.environ.get("SHEET_NAME", "Лист1")
 TIMEZONE        = os.environ.get("TIMEZONE", "Europe/Kiev")
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "60"))
 
-# Автоответ на личные сообщения
 AUTO_REPLY_TEXT = (
     "⚠️ Важно!\n\n"
     "Данный менеджер не осуществляет поддержку пользователей и не занимается решением технических или организационных вопросов.\n\n"
@@ -46,6 +45,9 @@ COL_TEXT      = 4
 COL_MEDIA_RU  = 5
 COL_MEDIA_UKR = 6
 COL_STATUS    = 7
+
+# Локальный кэш отправленных постов (защита от дублей)
+sent_posts = set()
 
 
 def get_sheet():
@@ -69,7 +71,6 @@ def translate_to_ukrainian(text: str) -> str:
         for part in result[0]:
             if part[0]:
                 translated += part[0]
-        logger.info(f"Перевод успешен, длина: {len(translated)}")
         return translated
     except Exception as e:
         logger.error(f"Ошибка перевода: {e}")
@@ -140,25 +141,21 @@ async def send_post(bot: Bot, chat_id: str, text: str, media_url: str):
 
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Автоответ на личные сообщения."""
     if update.message and update.message.chat.type == "private":
         user = update.message.from_user
-        logger.info(f"Личное сообщение от {user.first_name} (@{user.username}): {update.message.text}")
+        logger.info(f"Личное сообщение от {user.first_name}")
         try:
-            await update.message.reply_photo(
-                photo=AUTO_REPLY_PHOTO,
-                caption=AUTO_REPLY_TEXT
-            )
-            logger.info(f"Автоответ отправлен пользователю {user.first_name}")
+            await update.message.reply_photo(photo=AUTO_REPLY_PHOTO, caption=AUTO_REPLY_TEXT)
         except Exception as e:
-            logger.error(f"Ошибка отправки автоответа: {e}")
+            logger.error(f"Ошибка автоответа: {e}")
             try:
                 await update.message.reply_text(AUTO_REPLY_TEXT)
             except Exception as e2:
-                logger.error(f"Ошибка отправки текстового автоответа: {e2}")
+                logger.error(f"Ошибка текстового автоответа: {e2}")
 
 
 async def check_and_send(bot: Bot):
+    global sent_posts
     tz = pytz.timezone(TIMEZONE)
     now = datetime.now(tz)
     window_start = now - timedelta(minutes=2)
@@ -174,27 +171,40 @@ async def check_and_send(bot: Bot):
         return
 
     start_row = 1 if rows[0][COL_DATE].lower() in ("дата", "date") else 0
-    logger.info(f"Всего строк: {len(rows)}, проверяю с строки {start_row + 1}")
 
-    for i, row in enumerate(rows[start_row:], start=start_row + 2):
+    # Находим строки где есть дата — это настоящие посты
+    posts = []
+    for i, row in enumerate(rows[start_row:], start=start_row):
         if len(row) < 5:
             continue
+        date_val = row[COL_DATE].strip()
+        if not date_val:
+            continue
+        # Номер строки в Sheets (1-based)
+        sheet_row = i + 1
+        posts.append((sheet_row, row))
 
+    logger.info(f"Найдено постов с датой: {len(posts)}")
+
+    for sheet_row, row in posts:
+        # Пропускаем уже отправленные (по статусу в таблице)
         status = row[COL_STATUS].strip() if len(row) > COL_STATUS else ""
         if status.startswith("✅"):
+            continue
+
+        # Пропускаем уже отправленные (локальный кэш — защита от дублей)
+        post_key = f"{row[COL_DATE]}_{row[COL_TIME]}_{row[COL_CHAT_RU]}"
+        if post_key in sent_posts:
             continue
 
         date_val = row[COL_DATE]
         time_val = row[COL_TIME] if len(row) > COL_TIME else ""
 
-        if not date_val.strip():
-            continue
-
         post_dt = parse_datetime(date_val, time_val, tz)
         if post_dt is None:
             continue
 
-        logger.info(f"Строка {i}: дата поста {post_dt.strftime('%d.%m.%Y %H:%M')}, сейчас {now.strftime('%d.%m.%Y %H:%M')}")
+        logger.info(f"Строка {sheet_row}: дата поста {post_dt.strftime('%d.%m.%Y %H:%M')}, сейчас {now.strftime('%d.%m.%Y %H:%M')}")
 
         if window_start <= post_dt <= now:
             chat_ru   = row[COL_CHAT_RU].strip() if len(row) > COL_CHAT_RU else ""
@@ -203,16 +213,19 @@ async def check_and_send(bot: Bot):
             media_ru  = row[COL_MEDIA_RU].strip() if len(row) > COL_MEDIA_RU else ""
             media_ukr = row[COL_MEDIA_UKR].strip() if len(row) > COL_MEDIA_UKR else ""
 
+            # Сразу добавляем в кэш чтобы не отправить дважды
+            sent_posts.add(post_key)
+
             statuses = []
 
             if chat_ru:
                 try:
                     await send_post(bot, chat_ru, text, media_ru)
                     statuses.append("✅ РУ")
-                    logger.info(f"Строка {i}: РУ отправлено!")
+                    logger.info(f"Строка {sheet_row}: РУ отправлено!")
                 except TelegramError as e:
                     statuses.append(f"❌ РУ: {e}")
-                    logger.error(f"Строка {i}: РУ ошибка — {e}")
+                    logger.error(f"Строка {sheet_row}: РУ ошибка — {e}")
 
             if chat_ukr:
                 text_ukr = translate_to_ukrainian(text)
@@ -220,20 +233,20 @@ async def check_and_send(bot: Bot):
                 try:
                     await send_post(bot, chat_ukr, text_ukr, media_for_ukr)
                     statuses.append("✅ УКР")
-                    logger.info(f"Строка {i}: УКР отправлено!")
+                    logger.info(f"Строка {sheet_row}: УКР отправлено!")
                 except TelegramError as e:
                     statuses.append(f"❌ УКР: {e}")
-                    logger.error(f"Строка {i}: УКР ошибка — {e}")
+                    logger.error(f"Строка {sheet_row}: УКР ошибка — {e}")
 
             new_status = f"{' | '.join(statuses)} {now.strftime('%d.%m %H:%M')}"
             try:
-                sheet.update_cell(i, COL_STATUS + 1, new_status)
+                sheet.update_cell(sheet_row, COL_STATUS + 1, new_status)
+                logger.info(f"Статус записан в строку {sheet_row}")
             except Exception as e:
-                logger.error(f"Не удалось записать статус: {e}")
+                logger.error(f"Не удалось записать статус в строку {sheet_row}: {e}")
 
 
 async def scheduler(bot: Bot):
-    """Фоновая задача проверки расписания."""
     while True:
         try:
             await check_and_send(bot)
@@ -244,8 +257,6 @@ async def scheduler(bot: Bot):
 
 async def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
-    # Обработчик личных сообщений
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_private_message))
 
     bot = app.bot
@@ -254,7 +265,6 @@ async def main():
     logger.info(f"Проверка каждые {CHECK_INTERVAL} секунд")
     logger.info(f"Таблица ID: {SPREADSHEET_ID}")
 
-    # Запускаем планировщик постов параллельно
     async with app:
         await app.start()
         await app.updater.start_polling()
