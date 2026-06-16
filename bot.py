@@ -9,7 +9,8 @@ from datetime import datetime, timedelta
 import pytz
 import gspread
 from google.oauth2.service_account import Credentials
-from telegram import Bot
+from telegram import Bot, Update
+from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from telegram.error import TelegramError
 
 logging.basicConfig(
@@ -24,19 +25,27 @@ SHEET_NAME      = os.environ.get("SHEET_NAME", "Лист1")
 TIMEZONE        = os.environ.get("TIMEZONE", "Europe/Kiev")
 CHECK_INTERVAL  = int(os.environ.get("CHECK_INTERVAL", "60"))
 
+# Автоответ на личные сообщения
+AUTO_REPLY_TEXT = (
+    "⚠️ Важно!\n\n"
+    "Данный менеджер не осуществляет поддержку пользователей и не занимается решением технических или организационных вопросов.\n\n"
+    "Для получения помощи, пожалуйста, обращайтесь в Help Desk SlideEdu."
+)
+AUTO_REPLY_PHOTO = "https://drive.google.com/uc?export=download&id=1ME_JpmIRw95EldEXNVNNWvtn17vEb92X"
+
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
 
-COL_DATE      = 0  # A: Дата
-COL_TIME      = 1  # B: Время
-COL_CHAT_RU   = 2  # C: Chat ID РУ
-COL_CHAT_UKR  = 3  # D: Chat ID УКР
-COL_TEXT      = 4  # E: Текст поста
-COL_MEDIA_RU  = 5  # F: Медиа РУ
-COL_MEDIA_UKR = 6  # G: Медиа УКР
-COL_STATUS    = 7  # H: Статус
+COL_DATE      = 0
+COL_TIME      = 1
+COL_CHAT_RU   = 2
+COL_CHAT_UKR  = 3
+COL_TEXT      = 4
+COL_MEDIA_RU  = 5
+COL_MEDIA_UKR = 6
+COL_STATUS    = 7
 
 
 def get_sheet():
@@ -125,10 +134,28 @@ async def send_post(bot: Bot, chat_id: str, text: str, media_url: str):
     chat_id = chat_id.strip()
     if media_url and media_url.strip():
         url = convert_drive_url(media_url)
-        logger.info(f"Медиа URL: {url}")
         await bot.send_photo(chat_id=chat_id, photo=url, caption=text)
     else:
         await bot.send_message(chat_id=chat_id, text=text)
+
+
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Автоответ на личные сообщения."""
+    if update.message and update.message.chat.type == "private":
+        user = update.message.from_user
+        logger.info(f"Личное сообщение от {user.first_name} (@{user.username}): {update.message.text}")
+        try:
+            await update.message.reply_photo(
+                photo=AUTO_REPLY_PHOTO,
+                caption=AUTO_REPLY_TEXT
+            )
+            logger.info(f"Автоответ отправлен пользователю {user.first_name}")
+        except Exception as e:
+            logger.error(f"Ошибка отправки автоответа: {e}")
+            try:
+                await update.message.reply_text(AUTO_REPLY_TEXT)
+            except Exception as e2:
+                logger.error(f"Ошибка отправки текстового автоответа: {e2}")
 
 
 async def check_and_send(bot: Bot):
@@ -144,7 +171,6 @@ async def check_and_send(bot: Bot):
         return
 
     if not rows:
-        logger.warning("Таблица пустая")
         return
 
     start_row = 1 if rows[0][COL_DATE].lower() in ("дата", "date") else 0
@@ -166,7 +192,6 @@ async def check_and_send(bot: Bot):
 
         post_dt = parse_datetime(date_val, time_val, tz)
         if post_dt is None:
-            logger.warning(f"Строка {i}: не удалось распарсить дату '{date_val}' время '{time_val}'")
             continue
 
         logger.info(f"Строка {i}: дата поста {post_dt.strftime('%d.%m.%Y %H:%M')}, сейчас {now.strftime('%d.%m.%Y %H:%M')}")
@@ -181,7 +206,6 @@ async def check_and_send(bot: Bot):
             statuses = []
 
             if chat_ru:
-                logger.info(f"Строка {i}: отправляю РУ в {chat_ru}")
                 try:
                     await send_post(bot, chat_ru, text, media_ru)
                     statuses.append("✅ РУ")
@@ -191,10 +215,8 @@ async def check_and_send(bot: Bot):
                     logger.error(f"Строка {i}: РУ ошибка — {e}")
 
             if chat_ukr:
-                logger.info(f"Строка {i}: перевожу на украинский...")
                 text_ukr = translate_to_ukrainian(text)
                 media_for_ukr = media_ukr if media_ukr else media_ru
-                logger.info(f"Строка {i}: отправляю УКР в {chat_ukr}")
                 try:
                     await send_post(bot, chat_ukr, text_ukr, media_for_ukr)
                     statuses.append("✅ УКР")
@@ -204,28 +226,39 @@ async def check_and_send(bot: Bot):
                     logger.error(f"Строка {i}: УКР ошибка — {e}")
 
             new_status = f"{' | '.join(statuses)} {now.strftime('%d.%m %H:%M')}"
-
             try:
                 sheet.update_cell(i, COL_STATUS + 1, new_status)
             except Exception as e:
                 logger.error(f"Не удалось записать статус: {e}")
 
 
-async def main():
-    bot = Bot(token=TELEGRAM_TOKEN)
-    me = await bot.get_me()
-    logger.info(f"✅ Бот запущен: @{me.username}")
-    logger.info(f"Проверка каждые {CHECK_INTERVAL} секунд")
-    logger.info(f"Таблица ID: {SPREADSHEET_ID}")
-    logger.info(f"Лист: {SHEET_NAME}")
-    logger.info(f"Часовой пояс: {TIMEZONE}")
-
+async def scheduler(bot: Bot):
+    """Фоновая задача проверки расписания."""
     while True:
         try:
             await check_and_send(bot)
         except Exception as e:
-            logger.error(f"Ошибка в главном цикле: {e}")
+            logger.error(f"Ошибка в планировщике: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
+
+
+async def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    # Обработчик личных сообщений
+    app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, handle_private_message))
+
+    bot = app.bot
+    me = await bot.get_me()
+    logger.info(f"✅ Бот запущен: @{me.username}")
+    logger.info(f"Проверка каждые {CHECK_INTERVAL} секунд")
+    logger.info(f"Таблица ID: {SPREADSHEET_ID}")
+
+    # Запускаем планировщик постов параллельно
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
+        await scheduler(bot)
 
 
 if __name__ == "__main__":
