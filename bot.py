@@ -1,8 +1,11 @@
 import os
 import asyncio
+import io
 import logging
 import json
 import re
+import shutil
+import tempfile
 import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
@@ -122,6 +125,10 @@ def parse_datetime(date_val: str, time_val: str, tz) -> datetime | None:
     return None
 
 
+VIDEO_EXTENSIONS = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi")
+MAX_VIDEO_BYTES = 49 * 1024 * 1024
+
+
 def convert_drive_url(url: str) -> str:
     url = url.strip()
     match = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
@@ -131,13 +138,207 @@ def convert_drive_url(url: str) -> str:
     return url
 
 
+def _drive_file_id(url: str) -> str | None:
+    match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _is_youtube(url: str) -> bool:
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host in {
+        "youtu.be",
+        "youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtube-nocookie.com",
+    }
+
+
+def _path_is_video(url: str) -> bool:
+    path = urllib.parse.urlparse(url).path.lower()
+    return path.endswith(VIDEO_EXTENSIONS)
+
+
+def _video_filename(name: str, mime: str = "") -> str:
+    clean = (name or "").strip()
+    if clean.lower().endswith(VIDEO_EXTENSIONS):
+        return clean
+    mime_ext = {
+        "video/mp4": ".mp4",
+        "video/quicktime": ".mov",
+        "video/webm": ".webm",
+        "video/x-matroska": ".mkv",
+        "video/x-msvideo": ".avi",
+    }.get(mime, ".mp4")
+    return f"video{mime_ext}"
+
+
+def _google_access_token() -> str | None:
+    creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON", "").strip()
+    if not creds_json:
+        return None
+    try:
+        from google.auth.transport.requests import Request as GoogleRequest
+        creds = Credentials.from_service_account_info(json.loads(creds_json), scopes=SCOPES)
+        creds.refresh(GoogleRequest())
+        return creds.token
+    except Exception as exc:
+        logger.info(f"Токен Google Drive недоступен: {exc}")
+        return None
+
+
+def _drive_meta(file_id: str) -> dict | None:
+    token = _google_access_token()
+    if not token:
+        return None
+    url = (
+        "https://www.googleapis.com/drive/v3/files/"
+        f"{file_id}?fields=mimeType,name,size&supportsAllDrives=true"
+    )
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        logger.info(f"Метаданные Drive недоступны ({file_id}): {exc}")
+        return None
+
+
+def _download_bytes(url: str, headers: dict | None = None) -> tuple[bytes, str]:
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=180) as response:
+        data = response.read()
+        content_type = response.headers.get_content_type()
+    return data, content_type
+
+
+def _looks_like_html(data: bytes, content_type: str) -> bool:
+    if content_type.startswith("text/html"):
+        return True
+    head = data.lstrip()[:20].lower()
+    return head.startswith(b"<!doctype") or head.startswith(b"<html")
+
+
+def _download_drive_media(file_id: str) -> bytes:
+    token = _google_access_token()
+    if token:
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&supportsAllDrives=true"
+        try:
+            data, content_type = _download_bytes(url, {"Authorization": f"Bearer {token}"})
+            if data and not _looks_like_html(data, content_type):
+                return data
+        except Exception as exc:
+            logger.info(f"Скачивание через Drive API не удалось: {exc}")
+    public = f"https://drive.google.com/uc?export=download&confirm=t&id={file_id}"
+    data, content_type = _download_bytes(public)
+    if _looks_like_html(data, content_type):
+        raise TelegramError(
+            "Не удалось скачать видео с Google Drive. Откройте файл по ссылке «всем, у кого есть ссылка»."
+        )
+    return data
+
+
+def _download_youtube(url: str) -> str:
+    try:
+        import yt_dlp
+    except ImportError as exc:
+        raise TelegramError("Для видео с YouTube на сервере нужен пакет yt-dlp") from exc
+
+    tmp = tempfile.mkdtemp(prefix="tgvideo_")
+    opts = {
+        "format": "b[ext=mp4][acodec!=none][vcodec!=none]/b[ext=mp4]/b",
+        "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise TelegramError(f"Не удалось скачать видео с YouTube: {exc}") from exc
+
+    files = [
+        os.path.join(tmp, name)
+        for name in os.listdir(tmp)
+        if os.path.isfile(os.path.join(tmp, name))
+    ]
+    if not files:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise TelegramError("YouTube не отдал видеофайл")
+    return max(files, key=os.path.getsize)
+
+
+def _ensure_video_size(size: int) -> None:
+    if size > MAX_VIDEO_BYTES:
+        raise TelegramError("Видео больше 49 МБ — Telegram не примет его от бота")
+
+
+async def _send_video_bytes(bot: Bot, chat_id: str, text: str, data: bytes, filename: str) -> None:
+    _ensure_video_size(len(data))
+    await bot.send_video(
+        chat_id=chat_id,
+        video=io.BytesIO(data),
+        filename=filename,
+        caption=text,
+        supports_streaming=True,
+    )
+
+
 async def send_post(bot: Bot, chat_id: str, text: str, media_url: str):
+    """Картинка уходит фото, видео — файлом, который можно смотреть в чате."""
     chat_id = chat_id.strip()
-    if media_url and media_url.strip():
-        url = convert_drive_url(media_url)
+    raw = (media_url or "").strip()
+    try:
+        if not raw:
+            await bot.send_message(chat_id=chat_id, text=text)
+            return
+
+        if _is_youtube(raw):
+            path = await asyncio.to_thread(_download_youtube, raw)
+            try:
+                with open(path, "rb") as handle:
+                    data = handle.read()
+                name = _video_filename(os.path.basename(path))
+                logger.info(f"YouTube скачан: {name}, {len(data)} байт")
+                await _send_video_bytes(bot, chat_id, text, data, name)
+            finally:
+                shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+            return
+
+        if _path_is_video(raw):
+            logger.info(f"Прямая ссылка на видео: {raw}")
+            data, _ = await asyncio.to_thread(_download_bytes, raw)
+            filename = _video_filename(os.path.basename(urllib.parse.urlparse(raw).path))
+            await _send_video_bytes(bot, chat_id, text, data, filename)
+            return
+
+        file_id = _drive_file_id(raw)
+        if file_id:
+            meta = await asyncio.to_thread(_drive_meta, file_id) or {}
+            mime = meta.get("mimeType", "")
+            name = meta.get("name", "")
+            if mime.startswith("video/") or name.lower().endswith(VIDEO_EXTENSIONS):
+                logger.info(f"Видео с Google Drive: {name or file_id} ({mime})")
+                data = await asyncio.to_thread(_download_drive_media, file_id)
+                await _send_video_bytes(bot, chat_id, text, data, _video_filename(name, mime))
+                return
+
+        url = convert_drive_url(raw)
+        logger.info(f"Картинка: {url}")
         await bot.send_photo(chat_id=chat_id, photo=url, caption=text)
-    else:
-        await bot.send_message(chat_id=chat_id, text=text)
+    except TelegramError:
+        raise
+    except Exception as exc:
+        raise TelegramError(f"Не удалось отправить медиа: {exc}") from exc
 
 
 async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
