@@ -305,13 +305,11 @@ def _download_youtube(url: str) -> str:
                 last_error = str(exc)
                 shutil.rmtree(tmp, ignore_errors=True)
                 lowered = last_error.lower()
-                if ("not a bot" in lowered || "sign in to confirm" in lowered) {
+                if "not a bot" in lowered or "sign in to confirm" in lowered:
                     break
-                }
 
-    if ("ffmpeg" in last_error.lower()) {
+    if "ffmpeg" in last_error.lower():
         raise TelegramError("На сервере нет ffmpeg, видео с YouTube не собралось")
-    }
     raise TelegramError(f"Не удалось скачать видео с YouTube: {last_error}")
 
 
