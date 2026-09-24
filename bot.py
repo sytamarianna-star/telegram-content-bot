@@ -2,6 +2,7 @@ import os
 import asyncio
 import io
 import logging
+import html
 import json
 import re
 import shutil
@@ -63,7 +64,9 @@ def get_sheet():
     return gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
 
-def translate_to_ukrainian(text: str) -> str:
+def _translate_plain(text: str) -> str:
+    if not text.strip():
+        return text
     try:
         encoded = urllib.parse.quote(text)
         url = f"https://translate.googleapis.com/translate_a/single?client=gtx&sl=ru&tl=uk&dt=t&q={encoded}"
@@ -74,10 +77,34 @@ def translate_to_ukrainian(text: str) -> str:
         for part in result[0]:
             if part[0]:
                 translated += part[0]
-        return translated
+        return translated or text
     except Exception as e:
         logger.error(f"Ошибка перевода: {e}")
         return text
+
+
+def translate_to_ukrainian(text: str) -> str:
+    """Переводит текст и оставляет маркеры **жирный** на своих местах."""
+    parts = []
+    pos = 0
+    for match in re.finditer(r"\*\*(.+?)\*\*", text, flags=re.DOTALL):
+        parts.append(_translate_plain(text[pos:match.start()]))
+        parts.append(f"**{_translate_plain(match.group(1))}**")
+        pos = match.end()
+    parts.append(_translate_plain(text[pos:]))
+    return "".join(parts)
+
+
+def sheet_markdown_to_html(text: str) -> str:
+    """**жирный** из ячейки таблицы становится жирным в Telegram."""
+    parts = []
+    pos = 0
+    for match in re.finditer(r"\*\*(.+?)\*\*", text or "", flags=re.DOTALL):
+        parts.append(html.escape(text[pos:match.start()]))
+        parts.append("<b>" + html.escape(match.group(1)) + "</b>")
+        pos = match.end()
+    parts.append(html.escape((text or "")[pos:]))
+    return "".join(parts)
 
 
 def excel_date_to_datetime(excel_date_float: float, tz) -> datetime | None:
@@ -324,7 +351,8 @@ async def _send_video_bytes(bot: Bot, chat_id: str, text: str, data: bytes, file
         chat_id=chat_id,
         video=io.BytesIO(data),
         filename=filename,
-        caption=text,
+        caption=sheet_markdown_to_html(text),
+        parse_mode="HTML",
         supports_streaming=True,
     )
 
@@ -335,7 +363,11 @@ async def send_post(bot: Bot, chat_id: str, text: str, media_url: str):
     raw = (media_url or "").strip()
     try:
         if not raw:
-            await bot.send_message(chat_id=chat_id, text=text)
+            await bot.send_message(
+                chat_id=chat_id,
+                text=sheet_markdown_to_html(text),
+                parse_mode="HTML",
+            )
             return
 
         if _is_youtube(raw):
@@ -370,7 +402,12 @@ async def send_post(bot: Bot, chat_id: str, text: str, media_url: str):
 
         url = convert_drive_url(raw)
         logger.info(f"Картинка: {url}")
-        await bot.send_photo(chat_id=chat_id, photo=url, caption=text)
+        await bot.send_photo(
+            chat_id=chat_id,
+            photo=url,
+            caption=sheet_markdown_to_html(text),
+            parse_mode="HTML",
+        )
     except TelegramError:
         raise
     except Exception as exc:
