@@ -83,27 +83,56 @@ def _translate_plain(text: str) -> str:
         return text
 
 
+# ***жирный курсив***, **жирный**, *курсив* — как в ячейке таблицы.
+_SHEET_MARK = re.compile(r"\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*", re.DOTALL)
+
+def _marked(inner: str, kind: str) -> str:
+    if kind == "both":
+        return f"***{inner}***"
+    if kind == "bold":
+        return f"**{inner}**"
+    return f"*{inner}*"
+
+
+def _mark_kind(match: re.Match) -> str:
+    if match.group(1) is not None:
+        return "both"
+    if match.group(2) is not None:
+        return "bold"
+    return "italic"
+
+
 def translate_to_ukrainian(text: str) -> str:
-    """Переводит текст и оставляет маркеры **жирный** на своих местах."""
+    """Переводит текст и оставляет жирный и курсив на своих местах."""
     parts = []
     pos = 0
-    for match in re.finditer(r"\*\*(.+?)\*\*", text, flags=re.DOTALL):
+    for match in _SHEET_MARK.finditer(text):
         parts.append(_translate_plain(text[pos:match.start()]))
-        parts.append(f"**{_translate_plain(match.group(1))}**")
+        kind = _mark_kind(match)
+        inner = match.group(1) or match.group(2) or match.group(3)
+        parts.append(_marked(_translate_plain(inner), kind))
         pos = match.end()
     parts.append(_translate_plain(text[pos:]))
     return "".join(parts)
 
 
 def sheet_markdown_to_html(text: str) -> str:
-    """**жирный** из ячейки таблицы становится жирным в Telegram."""
+    """Звёздочки из таблицы становятся жирным и курсивом в Telegram."""
+    source = text or ""
     parts = []
     pos = 0
-    for match in re.finditer(r"\*\*(.+?)\*\*", text or "", flags=re.DOTALL):
-        parts.append(html.escape(text[pos:match.start()]))
-        parts.append("<b>" + html.escape(match.group(1)) + "</b>")
+    for match in _SHEET_MARK.finditer(source):
+        parts.append(html.escape(source[pos:match.start()]))
+        kind = _mark_kind(match)
+        inner = html.escape(match.group(1) or match.group(2) or match.group(3))
+        if kind == "both":
+            parts.append(f"<b><i>{inner}</i></b>")
+        elif kind == "bold":
+            parts.append(f"<b>{inner}</b>")
+        else:
+            parts.append(f"<i>{inner}</i>")
         pos = match.end()
-    parts.append(html.escape((text or "")[pos:]))
+    parts.append(html.escape(source[pos:]))
     return "".join(parts)
 
 
