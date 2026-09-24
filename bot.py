@@ -252,6 +252,8 @@ YOUTUBE_FORMATS = [
     "bv*[ext=mp4][height<=480]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]",
     "bv*[ext=mp4][height<=360]+ba[ext=m4a]/bv*[height<=360]+ba/b[height<=360]",
 ]
+# С IP сервера обычная страница YouTube просит войти. Эти клиенты страницу не открывают.
+YOUTUBE_CLIENTS = ("visionos", "android", "ios")
 
 
 def _download_youtube(url: str) -> str:
@@ -261,43 +263,55 @@ def _download_youtube(url: str) -> str:
         raise TelegramError("Для видео с YouTube на сервере нужен пакет yt-dlp") from exc
 
     last_error = "неизвестная ошибка"
-    for fmt in YOUTUBE_FORMATS:
-        tmp = tempfile.mkdtemp(prefix="tgvideo_")
-        opts = {
-            "format": fmt,
-            "merge_output_format": "mp4",
-            "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "retries": 3,
-            "fragment_retries": 3,
-            "socket_timeout": 30,
-        }
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.download([url])
-            files = [
-                os.path.join(tmp, name)
-                for name in os.listdir(tmp)
-                if os.path.isfile(os.path.join(tmp, name))
-            ]
-            if not files:
-                last_error = "YouTube не отдал видеофайл"
+    for client in YOUTUBE_CLIENTS:
+        for fmt in YOUTUBE_FORMATS:
+            tmp = tempfile.mkdtemp(prefix="tgvideo_")
+            opts = {
+                "format": fmt,
+                "merge_output_format": "mp4",
+                "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "retries": 3,
+                "fragment_retries": 3,
+                "socket_timeout": 30,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": [client],
+                        "player_skip": ["webpage", "configs"],
+                    }
+                },
+            }
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.download([url])
+                files = [
+                    os.path.join(tmp, name)
+                    for name in os.listdir(tmp)
+                    if os.path.isfile(os.path.join(tmp, name))
+                ]
+                if not files:
+                    last_error = "YouTube не отдал видеофайл"
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    continue
+                path = max(files, key=os.path.getsize)
+                if os.path.getsize(path) > MAX_VIDEO_BYTES:
+                    last_error = "Видео больше 49 МБ — Telegram не примет его от бота"
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    continue
+                return path
+            except Exception as exc:
+                last_error = str(exc)
                 shutil.rmtree(tmp, ignore_errors=True)
-                continue
-            path = max(files, key=os.path.getsize)
-            if os.path.getsize(path) > MAX_VIDEO_BYTES:
-                last_error = "Видео больше 49 МБ — Telegram не примет его от бота"
-                shutil.rmtree(tmp, ignore_errors=True)
-                continue
-            return path
-        except Exception as exc:
-            last_error = str(exc)
-            shutil.rmtree(tmp, ignore_errors=True)
+                lowered = last_error.lower()
+                if ("not a bot" in lowered || "sign in to confirm" in lowered) {
+                    break
+                }
 
-    if "ffmpeg" in last_error.lower():
+    if ("ffmpeg" in last_error.lower()) {
         raise TelegramError("На сервере нет ffmpeg, видео с YouTube не собралось")
+    }
     raise TelegramError(f"Не удалось скачать видео с YouTube: {last_error}")
 
 
