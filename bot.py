@@ -245,36 +245,60 @@ def _download_drive_media(file_id: str) -> bytes:
     return data
 
 
+# У YouTube часто нет готового mp4 со звуком. Скачиваем картинку и звук
+# отдельно и склеиваем через ffmpeg. Если файл больше лимита Telegram — ниже качество.
+YOUTUBE_FORMATS = [
+    "bv*[ext=mp4][height<=720]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]",
+    "bv*[ext=mp4][height<=480]+ba[ext=m4a]/bv*[height<=480]+ba/b[height<=480]",
+    "bv*[ext=mp4][height<=360]+ba[ext=m4a]/bv*[height<=360]+ba/b[height<=360]",
+]
+
+
 def _download_youtube(url: str) -> str:
     try:
         import yt_dlp
     except ImportError as exc:
         raise TelegramError("Для видео с YouTube на сервере нужен пакет yt-dlp") from exc
 
-    tmp = tempfile.mkdtemp(prefix="tgvideo_")
-    opts = {
-        "format": "b[ext=mp4][acodec!=none][vcodec!=none]/b[ext=mp4]/b",
-        "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
-    except Exception as exc:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise TelegramError(f"Не удалось скачать видео с YouTube: {exc}") from exc
+    last_error = "неизвестная ошибка"
+    for fmt in YOUTUBE_FORMATS:
+        tmp = tempfile.mkdtemp(prefix="tgvideo_")
+        opts = {
+            "format": fmt,
+            "merge_output_format": "mp4",
+            "outtmpl": os.path.join(tmp, "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 3,
+            "fragment_retries": 3,
+            "socket_timeout": 30,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+            files = [
+                os.path.join(tmp, name)
+                for name in os.listdir(tmp)
+                if os.path.isfile(os.path.join(tmp, name))
+            ]
+            if not files:
+                last_error = "YouTube не отдал видеофайл"
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue
+            path = max(files, key=os.path.getsize)
+            if os.path.getsize(path) > MAX_VIDEO_BYTES:
+                last_error = "Видео больше 49 МБ — Telegram не примет его от бота"
+                shutil.rmtree(tmp, ignore_errors=True)
+                continue
+            return path
+        except Exception as exc:
+            last_error = str(exc)
+            shutil.rmtree(tmp, ignore_errors=True)
 
-    files = [
-        os.path.join(tmp, name)
-        for name in os.listdir(tmp)
-        if os.path.isfile(os.path.join(tmp, name))
-    ]
-    if not files:
-        shutil.rmtree(tmp, ignore_errors=True)
-        raise TelegramError("YouTube не отдал видеофайл")
-    return max(files, key=os.path.getsize)
+    if "ffmpeg" in last_error.lower():
+        raise TelegramError("На сервере нет ffmpeg, видео с YouTube не собралось")
+    raise TelegramError(f"Не удалось скачать видео с YouTube: {last_error}")
 
 
 def _ensure_video_size(size: int) -> None:
