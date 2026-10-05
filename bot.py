@@ -6,6 +6,7 @@ import html
 import json
 import re
 import shutil
+import subprocess
 import tempfile
 import urllib.request
 import urllib.parse
@@ -369,12 +370,67 @@ def _download_youtube(url: str) -> str:
     raise TelegramError(f"Не удалось скачать видео с YouTube: {last_error}")
 
 
+def _telegram_video(data: bytes, filename: str) -> tuple[bytes, str]:
+    """Запись с телефона кладёт звук в монтажный лист. Telegram его пропускает и играет видео без звука.
+    Собираем обычный mp4, где картинка и звук уже совпадают."""
+    if not data:
+        return data, filename
+    tmp = tempfile.mkdtemp(prefix="tgsafe_")
+    src = os.path.join(tmp, "in.mp4")
+    dst = os.path.join(tmp, "out.mp4")
+    try:
+        with open(src, "wb") as handle:
+            handle.write(data)
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-i", src,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+            "-movflags", "+faststart",
+            dst,
+        ]
+        try:
+            result = subprocess.run(cmd, capture_output=True, timeout=180)
+        except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+            logger.info(f"ffmpeg не собрал видео со звуком: {exc}")
+            return data, filename
+        if result.returncode != 0 or not os.path.isfile(dst):
+            err = (result.stderr or b"").decode("utf-8", "replace")[-400:]
+            logger.info(f"ffmpeg: {err}")
+            if not any(mark in err.lower() for mark in ("audio", "matches no streams", "does not contain")):
+                return data, filename
+            silent = [
+                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                "-i", src,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                "-pix_fmt", "yuv420p", "-an",
+                "-movflags", "+faststart",
+                dst,
+            ]
+            try:
+                result = subprocess.run(silent, capture_output=True, timeout=180)
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                return data, filename
+            if result.returncode != 0 or not os.path.isfile(dst):
+                return data, filename
+        with open(dst, "rb") as handle:
+            ready = handle.read()
+        if not ready or len(ready) > MAX_VIDEO_BYTES:
+            logger.info(f"Собранное видео не подходит по размеру: {len(ready) if ready else 0}")
+            return data, filename
+        logger.info(f"Видео собрано для Telegram: {len(data)} -> {len(ready)} байт")
+        return ready, "video.mp4"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
 def _ensure_video_size(size: int) -> None:
     if size > MAX_VIDEO_BYTES:
         raise TelegramError("Видео больше 49 МБ — Telegram не примет его от бота")
 
 
 async def _send_video_bytes(bot: Bot, chat_id: str, text: str, data: bytes, filename: str) -> None:
+    data, filename = await asyncio.to_thread(_telegram_video, data, filename)
     _ensure_video_size(len(data))
     await bot.send_video(
         chat_id=chat_id,
